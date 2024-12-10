@@ -1,0 +1,725 @@
+---
+title: "fungal microbiome"
+author: "Elizabeth Green"
+date: "2023-05-08"
+output: html_document
+---
+
+```{r}
+library(vegan)
+library(tidyverse)
+library(lubridate)
+library(emmeans)
+library(viridis)
+library(DESeq2)
+library(plotrix)
+library(lme4)
+library(lmerTest)
+library(epifitter)
+library(RColorBrewer)
+library(scales)
+library(MuMIn)
+library(patchwork)
+
+theme_set(theme_bw())
+nutrient_colors = c("none" = "#A1D99B",
+                    "low" = "#41AB5D",
+                    "high" = "#005A32")
+```
+
+#loading data
+```{r}
+metadata <- read.csv("data/metadata.csv") %>%
+  mutate(survey.date = as.factor(mdy(survey.date))) %>%
+  dplyr::rename(Date = survey.date) %>%
+  mutate(Date = ifelse(Date == "2022-04-30", "2022-04-29", as.character(Date))) %>%
+  mutate(Date = ifelse(Date == "2022-06-09", "2022-06-07", as.character(Date))) %>%
+  mutate(Date = ymd(Date)) %>%
+  mutate(DateTreatment = paste(as.factor(Date), Treatment, sep = "_"))
+
+counts <- read.csv("data/counts.csv") %>%
+  pivot_longer(cols = !sample.ID,
+               names_to = "OTU",
+               values_to = "counts") %>%
+  mutate(OTU = str_replace(OTU, "X", ""))
+
+counts <- read.csv("data/counts4.csv") %>%
+  pivot_longer(cols = !c(OTU, sequence),
+               names_to = "sample.id",
+               values_to = "counts") %>%
+  na.omit()
+
+assignments <- read.csv("data/assignments4.csv") %>%
+  filter(sequence != "")
+```
+
+#filtering and normalizing data
+```{r}
+otu_filter <- counts %>%
+  filter(counts > 25) %>% #greater than 25 counts per ASV per sample
+  group_by(OTU) %>%
+  summarise(freq = n()) %>%
+  filter(freq > 5) #appear more than 5 times in the data
+
+counts <- counts %>%
+  inner_join(otu_filter, by = "OTU")
+
+counts_sample <- counts %>%
+  group_by(sample.id) %>%
+  summarise(sum = sum(counts)) %>%
+  filter(sum > 2000)  #samples with more than 500 reads
+
+counts_sample %>%
+  ggplot(aes(x = sum)) + geom_histogram(bins = 40) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(x = "Sampling Depth", y = "Number of Samples")
+
+counts_sample %>% summarize(median(sum))
+
+counts <- counts_sample %>%
+  inner_join(counts, by = "sample.id")
+
+counts_wide <- counts %>%
+  dplyr::select(sample.id, counts, OTU) %>%
+  pivot_wider(names_from = "OTU", values_from = "counts") %>%
+  column_to_rownames("sample.id") %>%
+  mutate(across(where(is.numeric), ~ .x + 1))
+
+counts_norm <- varianceStabilizingTransformation(as.matrix(counts_wide), blind = F) ##normalizing for ordination
+
+```
+
+#richness
+```{r}
+counts_summary <- counts %>%
+  inner_join(metadata, by = "sample.id") %>%
+  filter(counts != 0) %>%
+  group_by(sample.id, Date, Treatment, Block, Column, Row, Plot, plate, sum) %>%
+  summarise(counts = sum(counts),
+          OTUs = n()) %>%
+  mutate(Treatment = factor(Treatment, levels = c("none", "low", "high")))
+
+richness <- counts_summary %>%
+  group_by(sample.id, Date, Treatment, Plot, Block, plate, sum) %>%
+  summarise(OTUs = sum(OTUs))
+
+richness.fig <- richness %>%
+  ggplot(aes(x = Date, y = OTUs, color = Treatment)) +
+  stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1, se = F) +        
+  geom_point(aes(color = Treatment), position = position_jitter(width = 5), alpha = 0.8) +
+  scale_color_manual(values = nutrient_colors, name = "Fertilizer") +
+  labs(y = "Total Observed Taxa", x = "Survey Date") +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+
+richness <- richness %>%
+  mutate(Date2 = as.numeric(Date)^2)
+
+rich.mod <- lmer(log10(OTUs) ~ (Date + Date2) * Treatment + (1 + sum|Block/Plot), data = richness)
+qnorm(residuals(rich.mod))
+summary(rich.mod)
+anova(rich.mod, mode = "satterthwaite")
+AIC(rich.mod)
+
+```
+
+#shannon diversity
+```{r}
+shannon <- diversity(counts_wide)
+
+shannon <- as.data.frame(shannon) %>%
+  rownames_to_column("sample.id") %>%
+  inner_join(richness, by = "sample.id")
+
+shannon.fig <- shannon %>%
+  ggplot(aes(x = Date, y = shannon)) +
+  stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1, se = F) +
+  geom_point(aes(color = Treatment), alpha = 0.8, position = position_jitter(width = 5)) +
+  scale_color_manual(values = nutrient_colors, name = "Fertilizer") +
+  labs(x = "Survey Date", y = "Shannon Diversity Index") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+
+shannon <- shannon %>%
+  mutate(Date2 = as.numeric(Date)^2)
+
+shannon.mod <- lmer(log10(shannon) ~ (Date + Date2) * Treatment + (1 + sum|Block/Plot), data = shannon)
+qqnorm(residuals(shannon.mod))
+summary(shannon.mod)
+anova(shannon.mod, mode = "satterthwaite")
+AIC(shannon.mod)
+```
+
+##evenness
+```{r}
+evenness <- shannon %>%
+  mutate(evenness = shannon/log(OTUs))
+
+evenness.fig <- evenness %>%
+  ggplot(aes(x = Date, y = evenness)) +
+  stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1, se = F) +        
+  geom_point(aes(color = Treatment), position = position_jitter(width = 5), alpha = 0.8) +
+  scale_color_manual(values = nutrient_colors, name = "Fertilizer") +
+  labs(x = "Survey Date", y = "Evenness") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+
+evenness <- evenness %>%
+   mutate(Date2 = as.numeric(Date)^2) 
+evenness.mod <- lmer(log10(evenness) ~ (Date + Date2) * Treatment + (1 + sum|Block/Plot), data = evenness)
+qqnorm(residuals(evenness.mod))
+summary(evenness.mod)
+anova(evenness.mod, mode = "satterthwaite")
+AIC(evenness.mod)
+```
+
+
+#bray curtis
+```{r}
+metadata_norm <- metadata %>%
+  left_join(counts, by = "sample.id") %>%
+  group_by(sample.id) %>%
+  summarise(Treatment = unique(as.factor(Treatment)),
+            Date = as.factor(unique(Date)),
+            Plot = unique(Plot),
+            Block = unique(Block))
+
+bc_dist <- vegdist(abs(counts_norm), method = "bray")
+bc_nmds <- metaMDS(bc_dist)
+
+bc_df <- scores(bc_nmds, display = "sites") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample.id") %>% 
+  inner_join(metadata, by = "sample.id") %>%
+  mutate(Treatment = factor(Treatment, levels = c("none", "low", "high")))
+  
+
+bc <- ggplot(bc_df, aes(x = NMDS1, y = NMDS2, group = Date, color = as.factor(Date))) +
+  geom_point(size = 2, alpha = 0.8) +
+  stat_ellipse(linetype = 2, size = 1) +
+  scale_color_brewer(palette="Dark2", name = "Date") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) + ggtitle("Complete Community")
+bc
+
+bc_fert <- ggplot(bc_df, aes(x = NMDS1, y = NMDS2, group = Treatment, color = Treatment)) +
+  geom_point(size = 2, alpha = 0.8) +
+  stat_ellipse(linetype = 2, size = 1) +
+  scale_color_manual(values=nutrient_colors, name = "Fertilizer") +
+      theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) + ggtitle("Complete Community")
+bc_fert
+
+bc.perm <- adonis2(bc_dist ~ sum + Date * Treatment, data = shannon, strata = shannon$Block/shannon$Plot)
+bc.perm
+
+bc.beta <- betadisper(bc_dist, group = shannon$Date)
+anova(bc.beta)
+bc.pmod <- permutest(bc.beta , permutations = 99, pairwise = TRUE)
+bc.pmod
+
+bc.beta.df <- as.data.frame(bc.beta$distances) %>%
+  rownames_to_column("sample.id") %>%
+  inner_join(shannon, by = "sample.id") %>%
+  rename("bc.beta$distances" = "distance") %>%
+  mutate(distance = distance,
+         Treatment = factor(Treatment, levels = c("none", "low", "high")))
+
+beta.fig <- bc.beta.df %>%
+  ggplot(aes(x = Date, y = (distance))) +
+  stat_smooth(method = "lm", formula = y ~ x, size = 1, se = F) +        
+  geom_point(aes(color = Treatment), position = position_jitter(width = 5), alpha = 0.8) +
+  scale_color_manual(values = nutrient_colors, name = "Fertilizer") +
+      theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) +
+  labs(x = "Survey Date", y = "Distance to Centroid") + ggtitle("Complete Community")
+
+bc.beta.df <- bc.beta.df %>%
+   mutate(Date2 = as.numeric(Date)^2) 
+bc.beta.mod <- lmer(log10(distance)~ (Date) * Treatment + (1+sum|Block/Plot), data = bc.beta.df)
+qqnorm(residuals(bc.beta.mod))
+summary(bc.beta.mod)
+anova(bc.beta.mod)
+AIC(bc.beta.mod)
+```
+
+#Core Taxa
+```{r}
+core <- counts %>%
+  filter(counts > 0) %>%
+  group_by(OTU, sequence) %>%
+  summarise(n = n(),
+            abun = sum(counts)) %>%
+  mutate(occupancy = n/164,
+         rel_abun = abun/16450962,
+         core = ifelse(occupancy >= .60, "yes", "no")) %>%
+  arrange(desc(occupancy))
+
+rep <- counts %>%
+  filter(counts > 0) %>%
+  left_join(metadata, by = "sample.id") %>%
+  group_by(OTU, sequence, Date) %>%
+  summarise(n = n()) %>%
+  mutate(occupancy = n/36,
+         occupancy = case_when(occupancy >= 1 ~ 1,
+                               occupancy <= 1 ~ 0)) %>%
+  select(-n) %>%
+  pivot_wider(names_from = Date, values_from = occupancy)
+
+time <- counts %>%
+  filter(counts > 0) %>%
+  left_join(metadata, by = "sample.id") %>%
+  group_by(OTU, sequence, Date) %>%
+  summarise(n = n()) %>%
+  mutate(occupancy = n/36) %>%
+  select(-n) %>%
+  pivot_wider(names_from = Date, values_from = occupancy)
+
+
+
+core <- core %>%
+  left_join(assignments, by = "sequence")
+
+core %>%
+  ggplot(aes(x = log10(rel_abun), y = occupancy, color = core)) +
+  geom_point(show.legend = FALSE) +
+  scale_color_manual(values = c("black", "blue")) +
+  labs(y = "Occupancy", x = "log(Relative Abundance)") +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+
+core %>%
+  group_by(occupancy) %>%
+  summarise(sum(abun))
+
+split_dataframe_incremental <- function(df, split_var) {
+  # Sort the dataframe by the specified variable in decreasing order
+  df <- df[order(-df[[split_var]]), ]
+  
+  # Initialize an empty list to store the split dataframes
+  split_dataframes <- list()
+  
+  # Initialize a variable to keep track of the current split
+  current_split <- 1
+  
+  # Iterate through the rows of the sorted dataframe
+  for (i in 1:nrow(df)) {
+    # Create a new dataframe for the current split
+    split_dataframes[[current_split]] <- df[1:i, , drop = FALSE]
+    
+    # Move to the next split
+    current_split <- current_split + 1
+  }
+  
+  return(split_dataframes)
+}
+
+split_core <- split_dataframe_incremental(core, "occupancy")
+
+core_wide <- lapply(split_core, function(x) {
+  x %>%
+  left_join(counts, by = "OTU") %>%
+  dplyr::select(sample.id, counts, OTU) %>%
+  group_by(sample.id, OTU) %>%
+  summarise(counts = unique(counts)) %>%
+  pivot_wider(names_from = "OTU", values_from = "counts") %>%
+  column_to_rownames("sample.id") %>%
+  mutate(across(where(is.numeric), ~ .x + 1))
+  })
+
+core_bc <- lapply(core_wide, function(x) {
+  vegdist(abs(x), method = "bray")
+})
+
+core_mean <- lapply(core_bc, mean)
+
+core_change <- lapply(core_mean, function(x) {
+  1-x/core_mean[[359]]
+})
+
+core_change2 <- data.frame(core_change) %>%
+  pivot_longer(everything(), names_to = "name", values_to = "change") %>%
+  select(change)
+
+core_mean2 <- data.frame(core_mean) %>%
+  pivot_longer(everything(), names_to = "name", values_to = "mean") %>%
+  select(mean)
+
+core <- cbind(core, core_mean2, core_change2)
+
+core2 <- core %>%
+  group_by(occupancy) %>%
+  summarize(mean = mean(mean),
+            change = mean(change))
+
+core.fig <- core2 %>%
+  ggplot(aes(x = as.numeric(occupancy), y = as.numeric(mean))) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0.751, color = "blue") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = "ASVs by Occupancy", y = "% Bray Curtis Dissimilarity Attributed to Ranked ASVs") +
+  scale_x_reverse() +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+
+core.fig2 <- core2 %>%
+  ggplot(aes(x = as.numeric(occupancy), y = as.numeric(change))) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0.02, color = "blue") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = "ASVs by Occupancy", y = "Difference in Dissimilarity Explained") +
+  scale_x_reverse() +
+   theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+  
+
+
+core55 <- core %>%
+        filter(occupancy >= .55)
+
+
+```
+
+```{r}
+
+sum(core55$abun)/sum(counts_summary$counts)
+
+core55_wide <- core55 %>%
+  left_join(counts, by = "OTU") %>%
+  dplyr::select(sample.id, counts, OTU) %>%
+  group_by(sample.id, OTU) %>%
+  summarise(counts = unique(counts)) %>%
+  pivot_wider(names_from = "OTU", values_from = "counts") %>%
+  column_to_rownames("sample.id") %>%
+  mutate(across(where(is.numeric), ~ .x + 1))
+
+core55_norm <- varianceStabilizingTransformation(as.matrix(core55_wide), blind = F)
+
+core55_bc_dist <- vegdist(abs(core55_norm), method = "bray")
+core55_nmds <- metaMDS(core55_bc_dist)
+
+core55_bc_df <- scores(core55_nmds, display = "sites") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample.id") %>% 
+  inner_join(shannon, by = "sample.id") %>%
+  mutate(Treatment = factor(Treatment, levels = c("none", "low", "high")))
+
+plot_core55_fert <- ggplot(core55_bc_df, aes(x = NMDS1, y = NMDS2, group = Treatment, color = Treatment)) +
+  geom_point(size = 2, alpha = 0.8) +
+  stat_ellipse(linetype = 2, size = 1) +
+  scale_color_manual(values = nutrient_colors, name = "Fertilizer") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) + ggtitle("Core Community")
+plot_core55_fert
+
+plot_core55 <- ggplot(core55_bc_df, aes(x = NMDS1, y = NMDS2, group = as.factor(Date), color = as.factor(Date))) +
+  geom_point(size = 2, alpha = 0.8) +
+  stat_ellipse(linetype = 2, size = 1) +
+  scale_color_brewer(palette = "Dark2", name = "Date") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) + ggtitle("Core Community")
+plot_core55
+
+core.perm <- adonis2(core55_bc_dist ~ sum + Date * Treatment, data = shannon, strata = shannon$Block/shannon$Plot, na.action = na.exclude)
+core.perm
+
+core.beta <- betadisper(core55_bc_dist, group = shannon_filter$Date)
+anova(core.beta)
+core.pmod <- permutest(core.beta , permutations = 99, pairwise = TRUE)
+core.pmod
+plot(core.beta, hull=FALSE, ellipse=TRUE)
+
+core.beta.df <- as.data.frame(core.beta$distances) %>%
+  rownames_to_column("sample.id") %>%
+  inner_join(shannon_filter, by = "sample.id") %>%
+  mutate(Treatment = factor(Treatment, levels = c("none", "low", "high"))) %>%
+  rename("core.beta$distances" = "distance")
+
+core.beta.fig <- core.beta.df %>%
+  ggplot(aes(x = Date, y = (distance))) +
+  stat_smooth(method = "lm", formula = y ~ x, size = 1, se = F) +        
+  geom_point(aes(color = Treatment), position = position_jitter(width = 5), alpha = 0.8) +
+  scale_color_manual(values = nutrient_colors, name = "Fertilizer") +
+      theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) +
+  labs(x = "Survey Date", y = "Distance to Centroid") +
+  ggtitle("Core Community")
+
+core.beta.df <- core.beta.df %>%
+  mutate(Date2 = as.numeric(Date)^2)
+core.beta.mod <- lmer(log10(distance) ~ (Date) * Treatment + (1 + sum|Block/Plot), data = core.beta.df)
+qqnorm(residuals(core.beta.mod))
+summary(core.beta.mod)
+anova(core.beta.mod)
+AIC(core.beta.mod)
+
+```
+
+
+```{r}
+core_counts <- counts %>%
+  inner_join(core55, by = "OTU")
+
+core_counts_summary <- core_counts %>%
+  inner_join(metadata, by = "sample.id") %>%
+  filter(counts != 0) %>%
+  group_by(sample.id, Date, Treatment, Block, Column, Row, Plot, plate, sum) %>%
+  summarise(counts = sum(counts),
+          OTUs = n()) %>%
+  mutate(Treatment = factor(Treatment, levels = c("none", "low", "high")))
+
+core_richness <- core_counts_summary %>%
+  group_by(sample.id, Date, Treatment, Plot, Block, plate, sum) %>%
+  summarise(OTUs = sum(OTUs))
+
+core.richness.fig <- core_richness %>%
+ggplot(aes(x = Date, y = OTUs, color = Treatment)) +
+  stat_smooth(method = "lm", formula = y ~ x, size = 1, se = F) +
+  geom_point(aes(color = Treatment), alpha = 0.8, position = position_jitter(width = 5)) +
+  scale_color_manual(values = nutrient_colors, name = "Fertilizer") +
+  labs(x = "Survey Date", y = "Total Observed Taxa of Core") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+
+core_richness <- core_richness %>%
+  mutate(Date2 = as.numeric(Date)^2)
+
+core.rich.mod <- lmer(log10(OTUs) ~ (Date) * Treatment + (1 + sum|Block/Plot), data = core_richness)
+qnorm(residuals(core.rich.mod))
+summary(core.rich.mod)
+anova(core.rich.mod, mode = "satterthwaite")
+AIC(core.rich.mod)
+```
+
+#shannon diversity
+```{r}
+core.shannon <- diversity(core55_wide)
+
+core.shannon <- as.data.frame(core.shannon) %>%
+  rownames_to_column("sample.id") %>%
+  inner_join(core_richness, by = "sample.id")
+
+core.shannon.fig <- core.shannon %>%
+  ggplot(aes(x = Date, y = core.shannon)) +
+  stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1, se = F) +
+  geom_point(aes(color = Treatment), alpha = 0.8, position = position_jitter(width = 5)) +
+  scale_color_manual(values = nutrient_colors, name = "Fertilizer") +
+  labs(x = "Survey Date", y = "Shannon Diversity Index of Core") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+
+core.shannon <- core.shannon %>%
+  mutate(Date2 = as.numeric(Date)^2)
+
+core.shannon.mod <- lmer(log10(core.shannon) ~ (Date + Date2) * Treatment + (1 + sum|Block/Plot), data = core.shannon)
+qqnorm(residuals(core.shannon.mod))
+summary(core.shannon.mod)
+anova(core.shannon.mod)
+AIC(core.shannon.mod)
+```
+
+##evenness
+```{r}
+core.evenness <- core.shannon %>%
+  mutate(core.evenness = core.shannon/log(OTUs))
+
+core.evenness.fig <- core.evenness %>%
+  ggplot(aes(x = Date, y = core.evenness)) +
+  stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1, se = F) +
+  geom_point(aes(color = Treatment), alpha = 0.8, position = position_jitter(width = 5)) +
+  scale_color_manual(values = nutrient_colors, name = "Fertilizer") +
+  labs(x = "Survey Date", y = "Evenness of Core") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+
+core.evenness <- core.evenness %>%
+  mutate(Date2 = as.numeric(Date)^2)
+
+core.evenness.mod <- lmer(log10(core.evenness) ~ (Date + Date2) * Treatment + (1 + sum|Block/Plot), data = core.evenness)
+qqnorm(residuals(core.evenness.mod))
+summary(core.evenness.mod)
+anova(core.evenness.mod, mode = "satterthwaite")
+AIC(core.evenness.mod)
+```
+
+#bray curtis and infection
+```{r}
+survey <- read.csv("data/plot_survey22.csv")
+
+survey22 <- left_join(survey, metadata %>% select(Plot, Treatment, Block)) %>%
+  mutate(Treatment = factor(Treatment, levels = c("none", "low", "high")),
+         Date = mdy(Date),
+         Block = as.factor(Block),
+         per.Col = per.Col/100, per.Rhiz = per.Rhiz/100, per.Rust = per.Rust/100,
+         MonthDay = format(as.Date(Date), "%m-%d")) %>%
+  replace_na(list(Rhiz = 0, per.Rhiz = 0, Col = 0, per.Col = 0, Rust = 0, per.Rust = 0, GLS = 0))
+
+survey22 <- survey22 %>%
+  group_by(Date, Plot) %>%
+  summarise(prop.Rhiz = sum(Rhiz)/n(),
+            prop.Col = sum(Col)/n(),
+            prop.Rust = sum(Rust)/n(),
+            per.Rhiz = sum(per.Rhiz)/n(),
+            per.Col = sum(per.Col)/n(),
+            per.Rust = sum(per.Rust)/n())
+
+survey_metadata <- survey22 %>%
+  right_join(evenness, by = c("Plot", "Date")) %>%
+  mutate(Block = as.factor(Block),
+         Date = ymd(Date))
+
+counts_infect <- counts %>%
+  left_join(assignments, by = "sequence") %>%
+  filter(Family != "f_Ceratobasidiaceae")
+
+counts_infect_wide <- counts_infect %>%
+  dplyr::select(sample.id, counts, OTU) %>%
+  pivot_wider(names_from = "OTU", values_from = "counts") %>%
+  column_to_rownames("sample.id") %>%
+  mutate(across(where(is.numeric), ~ .x + 1))
+
+counts_infect_norm <- varianceStabilizingTransformation(as.matrix(counts_wide), blind = F)
+
+bc_infect_dist <- vegdist(abs(counts_infect_norm), method = "bray")
+bc_infect_nmds <- metaMDS(bc_infect_dist)
+
+infect.perm <- adonis2(bc_infect_dist ~ sum + Treatment * (per.Rhiz + per.Rust + per.Col), data = survey_metadata, strata = survey_metadata$Date/survey_metadata$Block)
+infect.perm
+
+infect_df <- scores(bc_infect_nmds, display = "sites") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample.id") %>% 
+  inner_join(survey_metadata, by = "sample.id")
+
+infect_rhiz <- ggplot(infect_df, aes(x = NMDS1, y = NMDS2, group = as.factor(Date), size = per.Rhiz, color = as.factor(Date))) +
+  geom_point(alpha = 0.8) +
+  stat_ellipse(linetype = 2, size = 1) +
+  labs(size = "Proportion of Leaves Infected",
+       color = "Date") +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) +
+  scale_color_brewer(palette = "Dark2") + ggtitle("Complete Community")
+infect_rhiz
+
+```
+
+```{r}
+core50_infect_wide <- core50 %>%
+  left_join(counts, by = "OTU") %>%
+  dplyr::select(sample.id, counts, OTU) %>%
+  group_by(sample.id, OTU) %>%
+  summarise(counts = unique(counts)) %>%
+  pivot_wider(names_from = "OTU", values_from = "counts") %>%
+  column_to_rownames("sample.id") %>%
+  mutate(across(where(is.numeric), ~ .x + 1))
+
+core50_infect_norm <- varianceStabilizingTransformation(as.matrix(core50_infect_wide), blind = F)
+
+core50_infect_bc_dist <- vegdist(abs(core50_infect_norm), method = "bray")
+core50_infect_nmds <- metaMDS(core50_infect_bc_dist)
+
+core_infect_df <- scores(core50_infect_nmds, display = "sites") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample.id") %>% 
+  inner_join(survey_metadata, by = "sample.id") %>%
+  mutate(Treatment = factor(Treatment, levels = c("none", "low", "high")))
+
+core_infect <- ggplot(core_infect_df, aes(x = NMDS1, y = NMDS2, group = as.factor(Date), size = per.Rhiz, color = as.factor(Date))) +
+  geom_point(alpha = 0.8) +
+  stat_ellipse(linetype = 2, size = 1) +
+  scale_color_brewer(palette = "Dark2", name = "Date") +
+  labs(size = "Proportion of Leaves Infected") +
+      theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)) + ggtitle("Core Community")
+core_infect
+
+core.infect.perm <- adonis2(core50_infect_bc_dist ~ sum + Treatment * (prop.Rhiz + prop.Rust + prop.Col), data = survey_metadata, strata = survey_metadata$Date/survey_metadata$Block)
+core.infect.perm
+```
+
+```{r}
+survey_metadata %>%
+  filter(per.Rhiz > 0) %>%
+  ggplot(aes(x = per.Rhiz, y = log(sum), color = as.factor(Date))) +
+  geom_point(position = position_jitter()) +
+  stat_smooth(method = "lm", size = 1, se = F) +
+  scale_color_brewer(palette = "Dark2", name = "Date") +
+  labs(y = "Shannon Diversity", x = "Proportion Infected with Anthracnose") +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14))
+
+infect.shannon <- lmer(log(shannon) ~ Treatment * (prop.Rhiz + prop.Rust + prop.Col) + (1 + sum|Date/Block), data = survey_metadata)
+qqnorm(residuals(infect.shannon))
+summary(infect.shannon)
+anova(infect.shannon)
+AIC(infect.shannon)
+
+infect.richness <- lmer(log(sum) ~ Treatment * (per.Rhiz + per.Rust + per.Col) + (1 + sum|Date/Block), data = survey_metadata)
+qqnorm(residuals(infect.richness))
+summary(infect.richness)
+anova(infect.richness)
+AIC(infect.richness)
+
+infect.evenness <- lmer(evenness ~ Treatment * (prop.Rhiz + prop.Rust + prop.Col) + (1 + sum|Date/Block), data = survey_metadata)
+qqnorm(residuals(infect.evenness))
+summary(infect.evenness)
+anova(infect.evenness)
+AIC(infect.evenness)
+```
+
+figures
+```{r}
+(shannon.fig + xlab(NULL)) / core.shannon.fig + plot_layout(guides = "collect") + plot_annotation(tag_levels = 'A')
+(richness.fig + xlab(NULL)) / core.richness.fig + plot_layout(guides = "collect") +  plot_annotation(tag_levels = 'A')
+(evenness.fig + xlab(NULL)) / core.evenness.fig + plot_layout(guides = "collect") + plot_annotation(tag_levels = 'A')
+
+(bc + xlab(NULL)) / (plot_core60) + plot_layout(guides = "collect") + plot_annotation(tag_levels = 'A')
+
+(bc_fert + xlab(NULL)) / (plot_core55_fert) + plot_layout(guides = "collect") + plot_annotation(tag_levels = 'A')
+
+(beta.fig + xlab(NULL)) / (core.beta.fig) + plot_layout(guides = "collect") + plot_annotation(tag_levels = 'A')
+
+(infect_rhiz + xlab(NULL)) / (core_infect) + plot_layout(guides = "collect") + plot_annotation(tag_levels = 'A')
+
+(core.fig + xlab(NULL)) / core.fig2 + plot_annotation(tag_levels = 'A')
+
+```
+
